@@ -1,10 +1,9 @@
 use lief_sys;
 
-use chrono::NaiveDateTime;
 use scroll::Pread;
 use scroll_derive::Pread;
 use std::{
-    ffi::{CStr, CString},
+    ffi::CString,
     fs::File,
     io::{self, BufReader, Read, Seek, SeekFrom, Write},
     mem, path, ptr, slice,
@@ -43,7 +42,7 @@ struct ImageLoadConfigDirectory32 {
     edit_list: u32,
     security_cookie: u32,
     se_handler_table: u32,
-    se_handle_count: u32,
+    se_handler_count: u32,
     guard_cf_check_function_pointer: u32,
     guard_cf_dispatch_function_pointer: u32,
     guard_cf_function_table: u32,
@@ -139,7 +138,7 @@ impl From<ImageLoadConfigDirectory32> for ImageLoadConfigDirectory {
             edit_list: dir32.edit_list as _,
             security_cookie: dir32.security_cookie as _,
             se_handler_table: dir32.se_handler_table as _,
-            se_handler_count: dir32.se_handle_count as _,
+            se_handler_count: dir32.se_handler_count as _,
             guard_cf_check_function_pointer: dir32.guard_cf_check_function_pointer as _,
             guard_cf_dispatch_function_pointer: dir32.guard_cf_dispatch_function_pointer as _,
             guard_cf_function_table: dir32.guard_cf_function_table as _,
@@ -180,13 +179,6 @@ struct Args {
 fn main() {
     let args = Args::from_args();
 
-    let tabbed_stdout = io::stdout();
-    let mut tabbed_stdout = {
-        let w = tabbed_stdout.lock();
-        let w = io::BufWriter::new(w);
-        TabWriter::new(w)
-    };
-
     let pe_name = args.input.to_string_lossy().into_owned();
 
     let raw_pe;
@@ -201,150 +193,225 @@ fn main() {
     };
 
     let pe_header = &pe.header;
-    let img_crs = pe_header.characteristics;
+    let img_crts = pe_header.characteristics;
 
     let optional_header = &pe.optional_header;
 
     let data_dirs = pe.data_directories;
     let data_dir_count = optional_header.numberof_rva_and_size;
 
-    let clr_data_dir_idx: u32 =
-        unsafe { mem::transmute(lief_sys::LIEF_PE_DATA_DIRECTORY::LIEF_PE_CLR_RUNTIME_HEADER) };
-    let clr_data_dir = if clr_data_dir_idx + 1 > data_dir_count {
-        None
-    } else {
-        let clr_data_dir: *mut lief_sys::Pe_DataDirectory_t =
-            unsafe { *data_dirs.offset(clr_data_dir_idx as isize) };
-        if clr_data_dir.is_null() {
+    let clr_config = {
+        let clr_data_dir_idx: u32 =
+            unsafe { mem::transmute(lief_sys::LIEF_PE_DATA_DIRECTORY::LIEF_PE_CLR_RUNTIME_HEADER) };
+        if clr_data_dir_idx + 1 > data_dir_count {
             None
         } else {
-            Some(unsafe { *clr_data_dir })
-        }
-    };
-
-    let img_load_cfg_dir_idx: u32 =
-        unsafe { mem::transmute(lief_sys::LIEF_PE_DATA_DIRECTORY::LIEF_PE_LOAD_CONFIG_TABLE) };
-
-    let img_load_cfg_dir: Option<ImageLoadConfigDirectory> = if img_load_cfg_dir_idx + 1
-        > data_dir_count
-    {
-        None
-    } else {
-        let load_cfg_data_dir: *mut lief_sys::Pe_DataDirectory_t =
-            unsafe { *data_dirs.offset(img_load_cfg_dir_idx as isize) };
-
-        if load_cfg_data_dir.is_null() {
-            None
-        } else {
-            let load_cfg_data_dir = unsafe { *load_cfg_data_dir };
-
-            if load_cfg_data_dir.rva == 0 || load_cfg_data_dir.size == 0 {
+            let clr_data_dir: *mut lief_sys::Pe_DataDirectory_t =
+                unsafe { *data_dirs.offset(clr_data_dir_idx as isize) };
+            if clr_data_dir.is_null() {
                 None
             } else {
-                let section_count = pe_header.numberof_sections;
-                let sections = pe.sections;
-                let sections = unsafe { slice::from_raw_parts(sections, section_count as usize) };
-
-                let mut sec_of_img_load_cfg_dir = ptr::null_mut();
-                for sec in sections {
-                    let sec = *sec;
-
-                    if sec.is_null() {
-                        continue;
-                    }
-
-                    let sec_data = unsafe { *sec };
-                    let rva = load_cfg_data_dir.rva.into();
-                    if sec_data.virtual_address < rva
-                        && rva < sec_data.virtual_address + sec_data.size
-                    {
-                        sec_of_img_load_cfg_dir = sec;
-                        break;
-                    }
-                }
-
-                if sec_of_img_load_cfg_dir.is_null() {
-                    None
-                } else {
-                    let sec_of_img_load_cfg_dir = unsafe { *sec_of_img_load_cfg_dir };
-                    let img_load_cfg_offset = load_cfg_data_dir.rva
-                        - sec_of_img_load_cfg_dir.virtual_address as u32
-                        + sec_of_img_load_cfg_dir.pointerto_relocation;
-
-                    let mut pe_file = File::open(&pe_name).unwrap();
-                    pe_file
-                        .seek(SeekFrom::Start(img_load_cfg_offset as u64))
-                        .expect("IMAGE_LOAD_CONFIG_DIRECTORY unreachable");
-                    let mut pe_file = BufReader::new(pe_file);
-
-                    // Try to "guess" the correct IMAGE_LOAD_CONFIG_DIRECTORY from magic
-                    use lief_sys::LIEF_PE_PE_TYPES::*;
-                    match optional_header.magic {
-                        LIEF_PE_PE32 => {
-                            let mut buffer =
-                                Vec::with_capacity(mem::size_of::<ImageLoadConfigDirectory32>());
-                            pe_file
-                                .read_exact(&mut buffer)
-                                .expect("Unable to read IMAGE_LOAD_CONFIG_DIRECTORY32");
-                            let cfg: ImageLoadConfigDirectory32 = buffer.pread(0).unwrap();
-                            Some(ImageLoadConfigDirectory::from(cfg))
-                        }
-
-                        LIEF_PE_PE32_PLUS => {
-                            let mut buffer =
-                                Vec::with_capacity(mem::size_of::<ImageLoadConfigDirectory64>());
-                            pe_file
-                                .read_exact(&mut buffer)
-                                .expect("Unable to read IMAGE_LOAD_CONFIG_DIRECTORY64");
-                            // let cfg: ImageLoadConfigDirectory64 = buffer.pread(0).unwrap();
-                            Some(buffer.pread(0).unwrap())
-                        }
-                    }
-                }
+                Some(unsafe { *clr_data_dir })
             }
         }
     };
 
-    // let sec_of_img_load_cfg_dir = if let Some(load_cfg_data_dir) = load_cfg_data_dir {
+    let load_config = {
+        let read_image_load_config_dir = || -> Option<ImageLoadConfigDirectory> {
+            let img_load_cfg_dir_idx: u32 = unsafe {
+                mem::transmute(lief_sys::LIEF_PE_DATA_DIRECTORY::LIEF_PE_LOAD_CONFIG_TABLE)
+            };
 
-    // } else {
-    //     None
-    // };
+            if img_load_cfg_dir_idx + 1 > data_dir_count {
+                return None;
+            }
 
-    // let img_load_cfg_dir = {
-    //     if let Some(sec_of_img_load_cfg_dir) = sec_of_img_load_cfg_dir {
-    //         let img_load_cfg_dir_offset =
-    //     }
-    // };
+            let load_cfg_data_dir: *mut lief_sys::Pe_DataDirectory_t =
+                unsafe { *data_dirs.offset(img_load_cfg_dir_idx as isize) };
+            if load_cfg_data_dir.is_null() {
+                return None;
+            }
 
-    let dll_crs = optional_header.dll_characteristics;
+            let load_cfg_data_dir = unsafe { *load_cfg_data_dir };
 
-    let is_dynamic_base = {
-        let dll_crs_dyn_base: u32 = unsafe {
-            mem::transmute(lief_sys::LIEF_PE_DLL_CHARACTERISTICS::LIEF_PE_IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE)
+            if load_cfg_data_dir.rva == 0 || load_cfg_data_dir.size == 0 {
+                return None;
+            }
+
+            let section_count = pe_header.numberof_sections;
+            let sections = pe.sections;
+            let sections = unsafe { slice::from_raw_parts(sections, section_count as usize) };
+
+            let mut sec_of_img_load_cfg_dir = ptr::null_mut();
+            for sec in sections {
+                let sec = *sec;
+
+                if sec.is_null() {
+                    continue;
+                }
+
+                let sec_data = unsafe { *sec };
+                let rva = load_cfg_data_dir.rva.into();
+                if sec_data.virtual_address < rva && rva < sec_data.virtual_address + sec_data.size
+                {
+                    sec_of_img_load_cfg_dir = sec;
+                    break;
+                }
+            }
+
+            if sec_of_img_load_cfg_dir.is_null() {
+                return None;
+            }
+
+            let sec_of_img_load_cfg_dir = unsafe { *sec_of_img_load_cfg_dir };
+            let img_load_cfg_offset = load_cfg_data_dir.rva
+                - sec_of_img_load_cfg_dir.virtual_address as u32
+                + sec_of_img_load_cfg_dir.pointerto_relocation;
+
+            let mut pe_file = File::open(&pe_name).unwrap();
+            pe_file
+                .seek(SeekFrom::Start(img_load_cfg_offset as u64))
+                .expect("IMAGE_LOAD_CONFIG_DIRECTORY unreachable");
+            let mut pe_file = BufReader::new(pe_file);
+
+            // Try to "guess" the correct IMAGE_LOAD_CONFIG_DIRECTORY from magic
+            use lief_sys::LIEF_PE_PE_TYPES::*;
+            match optional_header.magic {
+                LIEF_PE_PE32 => {
+                    let dir_size = mem::size_of::<ImageLoadConfigDirectory32>();
+                    if dir_size > sec_of_img_load_cfg_dir.size as usize {
+                        None
+                    } else {
+                        let mut buffer = vec![0; dir_size];
+                        pe_file
+                            .read_exact(&mut buffer)
+                            .expect("Unable to read IMAGE_LOAD_CONFIG_DIRECTORY32");
+                        let cfg: ImageLoadConfigDirectory32 = buffer.pread(0).unwrap();
+                        Some(ImageLoadConfigDirectory::from(cfg))
+                    }
+                }
+
+                LIEF_PE_PE32_PLUS => {
+                    let dir_size = mem::size_of::<ImageLoadConfigDirectory64>();
+                    if dir_size > sec_of_img_load_cfg_dir.size as usize {
+                        None
+                    } else {
+                        let mut buffer = vec![0; dir_size];
+                        pe_file
+                            .read_exact(&mut buffer)
+                            .expect("Unable to read IMAGE_LOAD_CONFIG_DIRECTORY64");
+                        Some(buffer.pread(0).unwrap())
+                    }
+                }
+            }
         };
-        dll_crs | dll_crs_dyn_base != 0
+
+        read_image_load_config_dir()
     };
 
-    // let is_dotnet = {
-    //     if let Some(load_cfg_data_dir) = load_cfg_data_dir {
-    //         clr_data_dir.
-    //     } else {
-    //         false
-    //     }
-    // }
+    let dll_crts = optional_header.dll_characteristics;
 
-    // let section_count = pe_header.numberof_sections;
-    // let sections = pe.sections;
-    // let sections = unsafe { slice::from_raw_parts(sections, section_count as usize) };
-    // for sec in sections {
-    //     let sec = *sec;
+    // security checks
 
-    //     if sec.is_null() {
-    //         continue
-    //     }
+    use lief_sys::LIEF_PE_DLL_CHARACTERISTICS as pe_dll_crts;
+    use lief_sys::LIEF_PE_HEADER_CHARACTERISTICS as pe_header_crts;
 
-    //     let sec_data = unsafe { *sec };
-    //     if sec_data.virtual_address < load_cfg_data_dir
-    // }
+    let is_dynamic_base = {
+        let dll_crts_dyn_base: u32 =
+            unsafe { mem::transmute(pe_dll_crts::LIEF_PE_IMAGE_DLL_CHARACTERISTICS_DYNAMIC_BASE) };
+        dll_crts | dll_crts_dyn_base != 0
+    };
+
+    let is_dotnet = clr_config.map_or(false, |config| config.rva != 0);
+
+    let is_aslr = {
+        let reloc_stripped_mask: u32 =
+            unsafe { mem::transmute(pe_header_crts::LIEF_PE_IMAGE_FILE_RELOCS_STRIPPED) };
+        let reloc_stripped = img_crts & (reloc_stripped_mask as u16) != 0;
+        reloc_stripped && is_dynamic_base
+    };
+
+    let is_high_entropy_va = dll_crts & 0x20 != 0 && is_aslr;
+
+    let is_force_integrity = {
+        let force_igrt_mask: u32 = unsafe {
+            mem::transmute(pe_dll_crts::LIEF_PE_IMAGE_DLL_CHARACTERISTICS_FORCE_INTEGRITY)
+        };
+        (dll_crts & force_igrt_mask) != 0
+    };
+
+    let is_nx = {
+        let nx_compat_mask: u32 =
+            unsafe { mem::transmute(pe_dll_crts::LIEF_PE_IMAGE_DLL_CHARACTERISTICS_NX_COMPAT) };
+        (dll_crts & nx_compat_mask) != 0 || is_dotnet
+    };
+
+    let is_isolation = {
+        let no_isolation_mask: u32 =
+            unsafe { mem::transmute(pe_dll_crts::LIEF_PE_IMAGE_DLL_CHARACTERISTICS_NO_ISOLATION) };
+        dll_crts & no_isolation_mask == 0
+    };
+
+    let is_seh = {
+        let no_seh_mask: u32 =
+            unsafe { mem::transmute(pe_dll_crts::LIEF_PE_IMAGE_DLL_CHARACTERISTICS_NO_SEH) };
+        dll_crts & no_seh_mask == 0
+    };
+
+    let is_cfg = {
+        let no_cfg_mask: u32 =
+            unsafe { mem::transmute(pe_dll_crts::LIEF_PE_IMAGE_DLL_CHARACTERISTICS_GUARD_CF) };
+        dll_crts & no_cfg_mask != 0
+    };
+
+    let is_rfg = load_config.map_or(false, |config| {
+        if config.size < 148 {
+            false
+        } else {
+            let guard_flags = config.guard_flags;
+            (guard_flags & 0x20000 != 0)
+                && (guard_flags & 0x40000 != 0 || guard_flags & 0x80000 != 0)
+        }
+    });
+
+    let is_safe_seh = load_config.map_or(false, |config| {
+        if config.size < 112 {
+            false
+        } else {
+            is_seh && config.se_handler_count != 0 && config.se_handler_table != 0
+        }
+    });
+
+    let is_gs = load_config.map_or(false, |config| {
+        if config.size < 96 {
+            false
+        } else {
+            config.security_cookie != 0
+        }
+    });
+
+    let tabbed_stdout = io::stdout();
+    let mut tabbed_stdout = {
+        let w = tabbed_stdout.lock();
+        let w = io::BufWriter::new(w);
+        TabWriter::new(w)
+    };
+    writeln!(tabbed_stdout, "Dynamic base:\t{:?}", is_dynamic_base);
+    writeln!(tabbed_stdout, "ASLR:\t{:?}", is_aslr);
+    writeln!(tabbed_stdout, "High entropy ASLR:\t{}", is_high_entropy_va);
+    writeln!(tabbed_stdout, "Force integrity:\t{}", is_force_integrity);
+    writeln!(tabbed_stdout, "Isolation:\t{}", is_isolation);
+    writeln!(tabbed_stdout, "NX protection:\t{}", is_nx);
+    writeln!(
+        tabbed_stdout,
+        "Structured exception handling (SEH):\t{}",
+        is_seh
+    );
+    writeln!(tabbed_stdout, "Control flow guard:\t{}", is_cfg);
+    writeln!(tabbed_stdout, "Return flow guard:\t{}", is_rfg);
+    writeln!(tabbed_stdout, "Safe SEH:\t{}", is_safe_seh);
+    writeln!(tabbed_stdout, "Buffer security check:\t{}", is_gs);
+    writeln!(tabbed_stdout, ".NET:\t{}", is_dotnet);
+
+    tabbed_stdout.flush().unwrap();
 }
